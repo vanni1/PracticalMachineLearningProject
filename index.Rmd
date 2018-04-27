@@ -1,0 +1,156 @@
+---
+title: "Practical Machine Learning Course Project : predicting how an exercise is performed"
+author: "Vanni de Clippele"
+date: "27 april 2018"
+output:
+  html_document:
+    df_print: paged
+    keep_md: yes
+  pdf_document: default
+self_contained: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+###Introduction 
+  
+6 test persons have been measured (at arms, belt, dumbbel) while performing a specific physical exercise.
+The exercise is either done correctly, or with a common mistake. We will try to predict those classifications
+by using the measurements as predictors. 
+The classification is captured by the classe variable, which has 5 outcomes : A (correct), B,C,D or E. 
+This is the variable we shall try to predict, based on the other variables.
+
+The article describing the set up can be found [here](https://d396qusza40orc.cloudfront.net/repdata%2Fpeer2_doc%2Fpd01016005curr.pdf)
+  
+###Synopsis  
+
+The project consists of choosing a prediction model, describing the process of model selection, its outcome,
+and application to a test set of 20 measurements.
+
+We will set our goal to 95% accuracy (RMSE, since we work with continuous data).
+In a first step the high number of dimensions is reduced from 160 to 43.
+The resulting dataset is then be randomly split into a training and a test dataset, reflecting the outcome diversity.
+Using a random forest approach, a model is selected and applied to the test dataset for validation.
+Prediction accuracy results high (> 99%). 
+
+The caret library is used.
+
+``` {r data_libraries, message=FALSE, warning=FALSE}
+library("caret")
+```
+### Data preprocessing
+
+#### Loading the data  
+
+``` {r data_load, cache = TRUE, warning=FALSE}
+url_train <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+download.file(url=url_train,destfile = "training.csv")
+train <-  read.csv("training.csv")
+
+url_test <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+download.file(url=url_test,destfile = "testing.csv")
+test <-  read.csv("testing.csv")
+
+train <-  read.csv("training.csv",stringsAsFactors = FALSE)
+test <-  read.csv("testing.csv",stringsAsFactors = FALSE)
+
+dim(train)
+dim(test)
+```
+
+#### Feature selection  
+
+The dataset is large with lots of variables, so we will try to reduce the set of relevant (predictor) variables as much as possible.
+
+First we remove the 67 variables which are mostly NA's (> 97% NA's), all others have no NA's.
+Next we remove the 34 variables with no variation.
+Finally we remove the variables without a relation to the outcome. From the testset we can see that our model has to predict from isolated testpoints, in the sense that we cannot take into account a time-dependent component, even if looking at the data structure, num_window seems to define the boundaries of an event resulting in its classification. We remove the row identifier X, as well as the timestamps and windows. The model might depend on the username, but for the sake of usability of the model, I will remove it as well. 
+As a last step highly correlated columns will be removed (by pairwise comparison, retaining one of each highly correlated pair (cor >0.9)).
+
+``` {r feature_selection, cache = TRUE}
+## calculate proportion of NA's in columns and remove unusable columns (with high number of NA's).
+testNA <- data.frame(names=names(train),colMeans(is.na(train)))
+dim(testNA[testNA$colMeans.is.na.train..> 0.97,])
+dim(testNA[testNA$colMeans.is.na.train..== 0,])
+
+train <- train[,colnames(train) %in% testNA[testNA$colMeans.is.na.train..== 0,]$names]
+
+## remove columns without variation
+NZV <- nearZeroVar(train, saveMetrics = TRUE)
+train <- train[,!NZV$nzv]
+
+## remove columns unrelated to the outcome
+train <- train[,-c(1,2,3,4,5,6)]
+
+## remove columns highly correlated to others, removing the classe variable from the correlation calculation.
+FC <- findCorrelation(cor(train[,-53]))
+train <- train[,-FC]
+
+## now we set the classe variable as a factor.
+train$classe <- as.factor(train$classe)
+```
+
+### Data slicing
+
+We create the test and training partitions (as the provided test set serves evaluation purposes)
+the partitioning is balanced on the outcome classe and globally about 70% of the full dataset.
+
+``` {r data_slicing, cache = TRUE}
+set.seed(5873)
+inTrain <- createDataPartition(train$classe,p=0.7,list=FALSE)
+training <- train[inTrain,]
+testing <- train[-inTrain,]
+dim(training)
+dim(testing)
+```
+
+### Modelling
+
+We still have a lot of variables and a lot of data (noisy, since based on real measurements), 
+so a random forest approach might be a good idea. To limit computation time, I will not use the default resampling settings (25 Bootstrapped resamples) but instead start with a k=3-fold cross-validation, and lower the number of trees from 500 to 100. This should give me a good initial idea about the computational abilities of my PC for this problem, as well as how well this approach might perform. Alternatively, I could preprocess the data with principal components analysis in order to further reduce the number of dimensions, before applying any model.
+
+``` {r train, cache = TRUE, warning=FALSE}
+  tc <- trainControl(method = "cv", 3)
+  modFitRF <- train(classe ~., method = "rf", data = training,trControl = tc,ntree = 100,allowParallel=TRUE, importance=TRUE) 
+  modFitRF
+```
+
+First results are satisfactory (accuracy>95%). Moreover the plot confirms that 100 trees was more than enough,
+as prediction accuracy for all 5 classes exceeds 98% and does not improve significantly from 60 trees onwards.
+
+``` {r fig1, cache = TRUE, warning=FALSE, fig.height = 6}
+  plot(modFitRF$finalModel,log="y",main="final model converging over added # of trees")
+```
+
+### Model validation on the testing dataset
+
+Let us validate with the testing dataset.
+
+``` {r predict, cache = TRUE, warning=FALSE}
+  pred <- predict(modFitRF,testing)
+  confusionMatrix(testing$classe,pred)
+```
+
+Our out-of-sample error, estimated by applying our model on the new testing dataset, is thus 0.63 % (= 1 - overall accuracy).
+
+Random forests are difficult to interpret as they result in an averaged forest of trees, hence the predicting algorithm as such cannot be plotted in a directly interpretable way. We might however get some insight by looking at the importance of the predictors, defined as their influence on the overall accuracy (what happens to the accuracy when leaving the variable out). Because we limited the # of trees in each forest to 100, and the # of randomly picked variables for each tree is sqrt(43), i.e. 6 or 7 out of 43, its interpretation may be limited.
+
+``` {r importance, cache = TRUE, warning=FALSE}
+  varImpt <- varImp(modFitRF)$importance
+  head(varImpt)
+```
+
+We can however plot how well the model fits the testing data : 
+
+``` {r fig2, cache = TRUE, warning=FALSE, fig.height = 6}
+qplot(classe, pred, data=testing,  colour= classe, geom = c("boxplot", "jitter"), main = "predicted vs. observed on testing data", xlab = "observed classe", ylab = "predicted classe")
+```
+
+### Applying validated model to the 20 provided datapoints
+
+``` {r applicationto20testpoints, cache = TRUE, warning=FALSE}
+predict(modFitRF, test)
+```
